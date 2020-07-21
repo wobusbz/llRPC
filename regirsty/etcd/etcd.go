@@ -5,18 +5,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wobusbz/llRPC/regirsty"
 	"go.etcd.io/etcd/clientv3"
 )
 
-type EtcdRegistry struct {
-	options *regirsty.Options
-	clinet  *clientv3.Client
-	service chan *regirsty.Service
+const (
+	MaxServiceNum          = 8
+	MaxSyncServiceInterval = 10 * time.Second
+)
 
+type EtcdRegistry struct {
+	options            *regirsty.Options
+	clinet             *clientv3.Client
+	service            chan *regirsty.Service
 	registerServiceMap map[string]*RegisterService
+	value              atomic.Value
+	me                 sync.Mutex
+}
+
+type AllServiceInfo struct {
+	serviceMap map[string]*regirsty.Service
 }
 
 type RegisterService struct {
@@ -29,12 +41,16 @@ type RegisterService struct {
 
 var (
 	etcdRegistry = &EtcdRegistry{
-		service:            make(chan *regirsty.Service, 8),
-		registerServiceMap: make(map[string]*RegisterService, 8),
+		service:            make(chan *regirsty.Service, MaxServiceNum),
+		registerServiceMap: make(map[string]*RegisterService, MaxServiceNum),
 	}
 )
 
 func init() {
+	allServiceInfo := AllServiceInfo{
+		serviceMap: make(map[string]*regirsty.Service),
+	}
+	etcdRegistry.value.Store(allServiceInfo)
 	regirsty.RegisteryPlugin(etcdRegistry)
 	go etcdRegistry.run()
 }
@@ -74,15 +90,22 @@ func (e *EtcdRegistry) Unregister(ctx context.Context, service *regirsty.Service
 }
 
 func (e *EtcdRegistry) run() {
+	ticker := time.NewTicker(MaxSyncServiceInterval)
 	for {
 		select {
 		case service := <-e.service:
-			if _, ok := e.registerServiceMap[service.Name]; ok {
+			if registryService, ok := e.registerServiceMap[service.Name]; ok {
+				for _, node := range service.Nodes{
+					registryService.service.Nodes = append(registryService.service.Nodes, node)
+				}
+				registryService.registerd = false
 				break
 			}
 			e.registerServiceMap[service.Name] = &RegisterService{
 				service: service,
 			}
+		case <-ticker.C:
+			e.syncServiceFromEtcd()
 		default:
 			e.registryOrKeepAlive()
 			time.Sleep(time.Microsecond * 500)
@@ -107,7 +130,7 @@ func (e *EtcdRegistry) registryService(service *RegisterService) (err error) {
 	}
 	service.id = resp.ID
 	for _, node := range service.service.Nodes {
-		temp := e.servicePath(&regirsty.Service{
+		temp := e.serviceNodePath(&regirsty.Service{
 			Name:  service.service.Name,
 			Nodes: []*regirsty.Node{node},
 		})
@@ -138,6 +161,95 @@ func (e *EtcdRegistry) keepAlive(service *RegisterService) {
 	}
 }
 
-func (e *EtcdRegistry) servicePath(service *regirsty.Service) string {
+func (e *EtcdRegistry) serviceNodePath(service *regirsty.Service) string {
 	return path.Join(e.options.RegistryPath, service.Name, fmt.Sprintf("%s:%d", service.Nodes[0].Ip, service.Nodes[0].Port))
+}
+
+func (e *EtcdRegistry) servicePath(name string) string {
+	return path.Join(e.options.RegistryPath, name)
+}
+
+func (e *EtcdRegistry) GetService(ctx context.Context, name string) (service *regirsty.Service, err error) {
+	service, ok := e.getServiceFromCache(ctx, name)
+	if ok {
+		return
+	}
+
+	e.me.Lock()
+	defer e.me.Unlock()
+	service, ok = e.getServiceFromCache(ctx, name)
+	if ok {
+		return
+	}
+	resp, err := e.clinet.Get(ctx, e.servicePath(name), clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	service = &regirsty.Service{
+		Name: name,
+	}
+	for _, kv := range resp.Kvs {
+		value := kv.Value
+		var tempService regirsty.Service
+		if err = json.Unmarshal(value, &tempService); err != nil {
+			return
+		}
+		for _, node := range tempService.Nodes {
+			service.Nodes = append(service.Nodes, node)
+		}
+	}
+	allServiceInfoOld := e.value.Load().(*AllServiceInfo)
+	allServiceInfoNew := &AllServiceInfo{
+		serviceMap: make(map[string]*regirsty.Service, MaxServiceNum),
+	}
+
+	for key, val := range allServiceInfoOld.serviceMap {
+		allServiceInfoNew.serviceMap[key] = val
+	}
+	allServiceInfoNew.serviceMap[name] = service
+	e.value.Store(allServiceInfoNew)
+	return
+}
+
+func (e *EtcdRegistry) getServiceFromCache(ctx context.Context, name string) (service *regirsty.Service, ok bool) {
+	allServiceInfo := e.value.Load().(*AllServiceInfo)
+	service, ok = allServiceInfo.serviceMap[name]
+	if ok {
+		return
+	}
+	return
+}
+
+func (e *EtcdRegistry) syncServiceFromEtcd() {
+	allServiceInfo := e.value.Load().(*AllServiceInfo)
+	var ctx = context.Background()
+	allServiceInfoNew := &AllServiceInfo{
+		serviceMap: make(map[string]*regirsty.Service, MaxServiceNum),
+	}
+
+	for _, service := range allServiceInfo.serviceMap {
+		resp, err := e.clinet.Get(ctx, e.servicePath(service.Name), clientv3.WithPrefix())
+		if err != nil {
+			allServiceInfoNew.serviceMap[service.Name] = service
+			continue
+		}
+
+		serviceNew := &regirsty.Service{
+			Name: service.Name,
+		}
+		for _, kv := range resp.Kvs {
+			value := kv.Value
+			var tempService regirsty.Service
+			if err = json.Unmarshal(value, &tempService); err != nil {
+				return
+			}
+
+			for _, node := range tempService.Nodes {
+				serviceNew.Nodes = append(serviceNew.Nodes, node)
+			}
+		}
+		allServiceInfoNew.serviceMap[service.Name] = serviceNew
+	}
+	e.value.Store(allServiceInfoNew)
 }
